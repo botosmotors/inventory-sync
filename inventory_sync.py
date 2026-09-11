@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-O'Neal FTP Inventory to Shopify Sync V8 PLUS
+O'Neal FTP Inventory to Shopify Sync V9
 AUTOMATA + TELJES ÖNELLENŐRZÉS (listázza az ÖSSZES módosítást + skipped termékeket + SKIP OKOK)
++ DRAFT TERMÉKEK SKIP-ELÉSE
 
 HELYES LOGIKA:
 - Ha stock > 0  → inventory_policy = "continue" (LEHET backorder - eladható készlet nélkül)
 - Ha stock = 0  → inventory_policy = "deny"     (NE lehessen backorder - nem eladható!)
+- DRAFT termékek → NEM módosítódnak
 """
 
 import os
@@ -83,19 +85,19 @@ class ShopifyAPI:
         }
     
     def get_products(self):
-        """Get all products from Shopify"""
+        """Get all products from Shopify (INCLUDING DRAFT!)"""
         if not self.access_token:
             logger.error("❌ No access token available")
             return False
         
-        url = f"{self.base_url}/products.json"
+        url = f"{self.base_url}/products.json?status=any"
         headers = self.get_auth_header()
         
         try:
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             self.products = response.json().get('products', [])
-            logger.info(f"✅ Fetched {len(self.products)} products from Shopify")
+            logger.info(f"✅ Fetched {len(self.products)} products from Shopify (including drafts)")
             return True
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Failed to fetch products: {e}")
@@ -225,7 +227,7 @@ class ONealFTPSync:
 def main():
     """Main sync function"""
     logger.info("=" * 60)
-    logger.info("🚀 O'Neal FTP to Shopify Inventory Sync V8 PLUS Started")
+    logger.info("🚀 O'Neal FTP to Shopify Inventory Sync V9 Started")
     logger.info(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
     
@@ -268,10 +270,25 @@ def main():
     available_skus = []      # stock > 0 → continue (eladható készlet nélkül)
     unavailable_skus = []    # stock = 0 → deny (nem eladható)
     skipped_items = []       # SKU nélküli variánsok + oka
+    draft_items = []         # DRAFT termékek
     
     for product in shopify.products:
         product_title = product.get('title', 'Unknown')
+        product_status = product.get('status', 'unknown')
         
+        # SKIP OK: DRAFT TERMÉK
+        if product_status == 'draft':
+            for variant in product.get('variants', []):
+                variant_title = variant.get('title', 'Unknown')
+                draft_items.append({
+                    'product': product_title,
+                    'variant': variant_title,
+                    'status': product_status
+                })
+                skipped_count += 1
+            continue  # Skip az egész terméket
+        
+        # ACTIVE termékek feldolgozása
         for variant in product.get('variants', []):
             sku = variant.get('sku')
             variant_title = variant.get('title', 'Unknown')
@@ -340,6 +357,16 @@ def main():
         if len(unavailable_skus) > 50:
             logger.info(f"   ... és további {len(unavailable_skus) - 50} termék")
     
+    if draft_items:
+        logger.info(f"\n🔴 DRAFT - NEM MÓDOSÍTOTT (INAKTÍV TERMÉKEK) ({len(draft_items)} db):")
+        logger.info("   (Draft termékek kizárva az automatikus szinkronizációból)")
+        for item in draft_items[:20]:
+            product = item.get('product', 'Unknown')
+            variant = item.get('variant', 'Unknown')
+            logger.info(f"   - {product} / {variant}")
+        if len(draft_items) > 20:
+            logger.info(f"   ... és további {len(draft_items) - 20} termék")
+    
     if skipped_items:
         logger.info(f"\n⚠️  SKIPPED - MIÉRT NEM MÓDOSÍTOTT ({len(skipped_items)} db):")
         logger.info("   " + "=" * 55)
@@ -353,7 +380,7 @@ def main():
             reasons_dict[reason].append(item)
         
         for reason, items in reasons_dict.items():
-            logger.info(f"\n   🔴 OK: {reason}")
+            logger.info(f"\n   ⚠️  OK: {reason}")
             logger.info(f"      Érintett termékek ({len(items)} db):")
             for item in items[:15]:
                 product = item.get('product', 'Unknown')
@@ -364,9 +391,10 @@ def main():
     
     logger.info("\n" + "=" * 60)
     logger.info(f"✅ Sync complete!")
-    logger.info(f"   Updated: {updated_count} variants")
+    logger.info(f"   Updated: {updated_count} variants (ACTIVE)")
     logger.info(f"   Failed: {failed_count} variants")
-    logger.info(f"   Skipped: {skipped_count} variants (SKIP OKOK: lásd fent!)")
+    logger.info(f"   Skipped (no SKU): {len(skipped_items)} variants")
+    logger.info(f"   Draft (inaktív): {len(draft_items)} variants")
     logger.info("=" * 60)
     
     return True
