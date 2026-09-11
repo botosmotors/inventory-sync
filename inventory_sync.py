@@ -85,42 +85,35 @@ class ShopifyAPI:
         }
     
     def get_products(self):
-        """Get ONLY O'Neal products from Shopify - with pagination"""
+        """Get ONLY O'Neal products from Shopify"""
         if not self.access_token:
             logger.error("❌ No access token available")
             return False
         
         headers = self.get_auth_header()
-        all_products = []
-        url = f"{self.base_url}/products.json?limit=250"  # Max limit per page
         
         try:
-            while url:
-                response = requests.get(url, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-                
-                # Szűr: CSAK O'Neal termékek
-                for product in data.get('products', []):
-                    title = product.get('title', '').upper()
-                    vendor = product.get('vendor', '').upper()
-                    
-                    # Ha a cím vagy vendor tartalmazza az "O'NEAL" vagy "ONEAL"-t
-                    if 'O\'NEAL' in title or 'ONEAL' in title or 'O\'NEAL' in vendor or 'ONEAL' in vendor:
-                        all_products.append(product)
-                
-                # Next page link
-                url = None
-                if 'Link' in response.headers:
-                    links = response.headers['Link'].split(',')
-                    for link in links:
-                        if 'rel="next"' in link:
-                            url = link.split(';')[0].strip('<>')
-                            break
+            # Hozz be max 250 terméket (limit)
+            url = f"{self.base_url}/products.json?limit=250"
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
             
-            self.products = all_products
-            logger.info(f"✅ Fetched {len(self.products)} O'Neal products from Shopify")
+            all_products = response.json().get('products', [])
+            
+            # Szűr: CSAK O'Neal termékek
+            oneal_products = []
+            for product in all_products:
+                title = product.get('title', '').upper()
+                vendor = product.get('vendor', '').upper()
+                
+                # Ha a cím vagy vendor tartalmazza az "O'NEAL" vagy "ONEAL"-t
+                if 'O\'NEAL' in title or 'ONEAL' in title or 'O\'NEAL' in vendor or 'ONEAL' in vendor:
+                    oneal_products.append(product)
+            
+            self.products = oneal_products
+            logger.info(f"✅ Fetched {len(oneal_products)} O'Neal products from Shopify")
             return True
+            
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Failed to fetch products: {e}")
             return False
