@@ -34,7 +34,7 @@ SHOPIFY_CLIENT_ID = os.getenv('SHOPIFY_CLIENT_ID')
 SHOPIFY_CLIENT_SECRET = os.getenv('SHOPIFY_CLIENT_SECRET')
 
 class ShopifyAPI:
-    """Shopify Admin API wrapper - Basic Auth"""
+    """Shopify Admin API wrapper - OAuth2 Client Credentials"""
     
     def __init__(self, store, client_id, client_secret):
         self.store = store
@@ -42,19 +42,52 @@ class ShopifyAPI:
         self.client_secret = client_secret
         self.api_version = "2024-10"
         self.base_url = f"https://{self.store}/admin/api/{self.api_version}"
+        self.access_token = None
         self.products = []
+        self.authenticate()
+    
+    def authenticate(self):
+        """Get OAuth2 access token using client credentials"""
+        url = f"https://{self.store}/admin/oauth/access_token"
+        
+        payload = {
+            'client_id': self.client_id,
+            'client_secret': self.client_secret,
+            'grant_type': 'client_credentials'
+        }
+        
+        try:
+            response = requests.post(url, data=payload)
+            response.raise_for_status()
+            data = response.json()
+            self.access_token = data.get('access_token')
+            
+            if self.access_token:
+                logger.info("✅ Shopify OAuth2 authentication successful")
+                return True
+            else:
+                logger.error(f"❌ No access token in response: {data}")
+                return False
+        except requests.exceptions.RequestException as e:
+            logger.error(f"❌ Shopify authentication failed: {e}")
+            return False
     
     def get_auth_header(self):
-        """Get Basic Auth header from client credentials"""
-        credentials = f"{self.client_id}:{self.client_secret}"
-        encoded = base64.b64encode(credentials.encode()).decode()
+        """Get Authorization header"""
+        if not self.access_token:
+            return None
+        
         return {
-            'Authorization': f'Basic {encoded}',
+            'X-Shopify-Access-Token': self.access_token,
             'Content-Type': 'application/json'
         }
     
     def get_products(self):
         """Get all products from Shopify"""
+        if not self.access_token:
+            logger.error("No access token available")
+            return False
+        
         url = f"{self.base_url}/products.json"
         headers = self.get_auth_header()
         
@@ -70,6 +103,9 @@ class ShopifyAPI:
     
     def update_inventory_policy(self, product_id, variant_id, policy):
         """Update inventory policy (continue or deny)"""
+        if not self.access_token:
+            return False
+        
         url = f"{self.base_url}/products/{product_id}/variants/{variant_id}.json"
         headers = self.get_auth_header()
         
@@ -169,6 +205,11 @@ def main():
     # Initialize
     oneal = ONealFTPSync(ONEAL_FTP_HOST, ONEAL_FTP_USER, ONEAL_FTP_PASSWORD, ONEAL_FTP_FILE)
     shopify = ShopifyAPI(SHOPIFY_STORE, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET)
+    
+    # Check authentication
+    if not shopify.access_token:
+        logger.error("❌ Failed to authenticate with Shopify")
+        return False
     
     # Download O'Neal inventory
     csv_content = oneal.download_inventory()
