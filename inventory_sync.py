@@ -141,17 +141,20 @@ class ONealFTPSync:
         self.inventory_data = {}
     
     def download_inventory(self):
-        """Download inventory CSV from FTP"""
+        """Download inventory CSV from FTP - BINARY MODE"""
         try:
             ftp = ftplib.FTP(self.host)
             ftp.login(self.user, self.password)
             logger.info(f"✅ Connected to FTP: {self.host}")
             
-            data = []
-            ftp.retrlines(f'RETR {self.filename}', data.append)
+            # BINÁRIS mód - teljes fájl letöltés egyszerre
+            import io
+            data_buffer = io.BytesIO()
+            ftp.retrbinary(f'RETR {self.filename}', data_buffer.write)
             ftp.quit()
             
-            csv_content = '\n'.join(data)
+            # UTF-8 dekódolás
+            csv_content = data_buffer.getvalue().decode('utf-8')
             logger.info(f"✅ Downloaded inventory file: {self.filename}")
             return csv_content
         
@@ -213,6 +216,12 @@ class ONealFTPSync:
                         row_count += 1
             
             logger.info(f"✅ Parsed {row_count} items from inventory")
+            
+            # DEBUG: Kiírja az első 20 parsolt SKU-t
+            logger.info(f"🔍 DEBUG - Első 20 parsolt SKU:")
+            for i, (sku, data) in enumerate(list(self.inventory_data.items())[:20]):
+                logger.info(f"   {i+1}. {sku} → stock={data.get('stock')}")
+            
             return True
         
         except Exception as e:
