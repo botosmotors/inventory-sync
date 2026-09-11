@@ -85,7 +85,7 @@ class ShopifyAPI:
         }
     
     def get_products(self):
-        """Get ONLY O'Neal products from Shopify"""
+        """Get all products from Shopify (max 250) - filter by O'Neal CSV"""
         if not self.access_token:
             logger.error("❌ No access token available")
             return False
@@ -93,25 +93,13 @@ class ShopifyAPI:
         headers = self.get_auth_header()
         
         try:
-            # Hozz be max 250 terméket (limit)
+            # Hozz be max 250 terméket
             url = f"{self.base_url}/products.json?limit=250"
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             
-            all_products = response.json().get('products', [])
-            
-            # Szűr: CSAK O'Neal termékek
-            oneal_products = []
-            for product in all_products:
-                title = product.get('title', '').upper()
-                vendor = product.get('vendor', '').upper()
-                
-                # Ha a cím vagy vendor tartalmazza az "O'NEAL" vagy "ONEAL"-t
-                if 'O\'NEAL' in title or 'ONEAL' in title or 'O\'NEAL' in vendor or 'ONEAL' in vendor:
-                    oneal_products.append(product)
-            
-            self.products = oneal_products
-            logger.info(f"✅ Fetched {len(oneal_products)} O'Neal products from Shopify")
+            self.products = response.json().get('products', [])
+            logger.info(f"✅ Fetched {len(self.products)} products from Shopify")
             return True
             
         except requests.exceptions.RequestException as e:
