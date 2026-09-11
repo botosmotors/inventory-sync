@@ -85,19 +85,19 @@ class ShopifyAPI:
         }
     
     def get_products(self):
-        """Get all products from Shopify (INCLUDING DRAFT!)"""
+        """Get all products from Shopify"""
         if not self.access_token:
             logger.error("❌ No access token available")
             return False
         
-        url = f"{self.base_url}/products.json?status=any"
+        url = f"{self.base_url}/products.json"
         headers = self.get_auth_header()
         
         try:
             response = requests.get(url, headers=headers)
             response.raise_for_status()
             self.products = response.json().get('products', [])
-            logger.info(f"✅ Fetched {len(self.products)} products from Shopify (including drafts)")
+            logger.info(f"✅ Fetched {len(self.products)} products from Shopify")
             return True
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Failed to fetch products: {e}")
