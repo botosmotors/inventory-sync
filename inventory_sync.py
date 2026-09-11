@@ -3,6 +3,10 @@
 O'Neal FTP Inventory to Shopify Sync
 Automatikusan letölti az O'Neal inventory CSV-t az FTP-ről,
 és frissíti a Shopify termékinventoryt.
+
+Logic:
+- Ha stock > 0  → inventory_policy = "deny"   (NE lehessen backorder)
+- Ha stock = 0  → inventory_policy = "continue" (LEHET backorder)
 """
 
 import os
@@ -101,7 +105,11 @@ class ShopifyAPI:
             return False
     
     def update_inventory_policy(self, product_id, variant_id, policy):
-        """Update inventory policy (continue or deny)"""
+        """
+        Update inventory policy
+        policy = "deny"     (NE eladható készlet nélkül - stock > 0)
+        policy = "continue" (ELADHATÓ készlet nélkül - stock = 0)
+        """
         if not self.access_token:
             return False
         
@@ -119,7 +127,7 @@ class ShopifyAPI:
             response.raise_for_status()
             return True
         except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Failed to update inventory policy for variant {variant_id}: {e}")
+            logger.debug(f"Failed to update variant {variant_id}: {e}")
             return False
 
 
@@ -151,14 +159,34 @@ class ONealFTPSync:
             logger.error(f"❌ FTP error: {e}")
             return None
     
+    def detect_delimiter(self, csv_content):
+        """Detect CSV delimiter (;, tab, comma, space)"""
+        first_line = csv_content.split('\n')[0] if csv_content else ""
+        
+        delimiters = [';', '\t', ',', ' ']
+        delimiter = ';'  # default
+        
+        for delim in delimiters:
+            if delim in first_line:
+                delimiter = delim
+                logger.info(f"✅ Detected CSV delimiter: '{repr(delimiter)}'")
+                break
+        
+        return delimiter
+    
     def parse_inventory(self, csv_content):
         """Parse CSV and extract stock data"""
         try:
-            reader = csv.DictReader(StringIO(csv_content), delimiter=';')
+            # Auto-detect delimiter
+            delimiter = self.detect_delimiter(csv_content)
+            
+            reader = csv.DictReader(StringIO(csv_content), delimiter=delimiter)
             
             if reader.fieldnames is None:
                 logger.error("❌ CSV is empty or invalid")
                 return False
+            
+            logger.info(f"CSV fields: {reader.fieldnames}")
             
             row_count = 0
             for row in reader:
@@ -185,7 +213,7 @@ class ONealFTPSync:
             return False
     
     def get_stock_status(self, sku):
-        """Get stock status for SKU"""
+        """Get stock status for SKU - returns has_stock boolean"""
         return self.inventory_data.get(sku, {}).get('has_stock', False)
 
 
@@ -229,6 +257,7 @@ def main():
     # Sync inventory
     updated_count = 0
     skipped_count = 0
+    failed_count = 0
     
     for product in shopify.products:
         for variant in product.get('variants', []):
@@ -248,18 +277,23 @@ def main():
             # Check O'Neal stock
             has_stock = oneal.get_stock_status(sku)
             
-            # Determine policy: 'continue' if has stock, 'deny' if no stock
-            policy = 'continue' if has_stock else 'deny'
+            # Determine policy:
+            # - has_stock (stock > 0)  → "deny"     (NE eladható készlet nélkül)
+            # - NO stock (stock = 0)   → "continue" (ELADHATÓ készlet nélkül)
+            policy = "deny" if has_stock else "continue"
             
             # Update Shopify
             if shopify.update_inventory_policy(product['id'], variant['id'], policy):
                 updated_count += 1
-                status = "✅ In stock" if has_stock else "❌ Out of stock"
+                status = "📦 In stock (deny)" if has_stock else "📭 No stock (continue)"
                 logger.info(f"  {sku}: {status}")
+            else:
+                failed_count += 1
     
     logger.info("=" * 60)
     logger.info(f"✅ Sync complete!")
     logger.info(f"   Updated: {updated_count} variants")
+    logger.info(f"   Failed: {failed_count} variants")
     logger.info(f"   Skipped: {skipped_count} variants (no SKU)")
     logger.info("=" * 60)
     
