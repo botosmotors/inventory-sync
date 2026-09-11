@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-O'Neal FTP Inventory to Shopify Sync
-Automatikusan letölti az O'Neal inventory CSV-t az FTP-ről,
-és frissíti a Shopify termékinventoryt.
+O'Neal FTP Inventory to Shopify Sync V7 FINAL
+AUTOMATA + ÖNELLENŐRZÉS (listázza a módosított termékeket)
 
-Logic:
-- Ha stock > 0  → inventory_policy = "deny"   (NE lehessen backorder)
-- Ha stock = 0  → inventory_policy = "continue" (LEHET backorder)
+HELYES LOGIKA:
+- Ha stock > 0  → inventory_policy = "continue" (LEHET backorder - eladható készlet nélkül)
+- Ha stock = 0  → inventory_policy = "deny"     (NE lehessen backorder - nem eladható!)
 """
 
 import os
@@ -103,7 +102,11 @@ class ShopifyAPI:
             return False
     
     def update_inventory_policy(self, product_id, variant_id, policy):
-        """Update inventory policy"""
+        """
+        Update inventory policy
+        policy = "deny"     (NE lehessen backorder - nem eladható)
+        policy = "continue" (LEHET backorder - eladható készlet nélkül)
+        """
         if not self.access_token:
             return False
         
@@ -177,9 +180,9 @@ class ONealFTPSync:
                 logger.error("❌ Could not find header with 'item_number'")
                 return False
             
-            logger.info(f"✅ Found header at line {header_idx}: {header_line[:100]}")
+            logger.info(f"✅ Found header at line {header_idx}")
             
-            # Parse data lines (from header_idx + 1 onwards)
+            # Parse data lines
             row_count = 0
             
             for i in range(header_idx + 1, len(lines)):
@@ -222,7 +225,7 @@ class ONealFTPSync:
 def main():
     """Main sync function"""
     logger.info("=" * 60)
-    logger.info("🚀 O'Neal FTP to Shopify Inventory Sync Started")
+    logger.info("🚀 O'Neal FTP to Shopify Inventory Sync V7 FINAL Started")
     logger.info(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
     
@@ -261,6 +264,10 @@ def main():
     skipped_count = 0
     failed_count = 0
     
+    # Listázáshoz
+    available_skus = []      # stock > 0 → continue (eladható készlet nélkül)
+    unavailable_skus = []    # stock = 0 → deny (nem eladható)
+    
     for product in shopify.products:
         for variant in product.get('variants', []):
             sku = variant.get('sku')
@@ -278,18 +285,45 @@ def main():
             # Check O'Neal stock
             has_stock = oneal.get_stock_status(sku)
             
-            # Determine policy
-            policy = "deny" if has_stock else "continue"
+            # HELYES LOGIKA:
+            # stock > 0 → "continue" (LEHET backorder - eladható készlet nélkül)
+            # stock = 0 → "deny"     (NE lehessen backorder - nem eladható)
+            policy = "continue" if has_stock else "deny"
             
             # Update Shopify
             if shopify.update_inventory_policy(product['id'], variant['id'], policy):
                 updated_count += 1
-                status = "📦 In stock (deny)" if has_stock else "📭 No stock (continue)"
-                logger.info(f"  {sku}: {status}")
+                if has_stock:
+                    available_skus.append(sku)
+                    logger.info(f"  ✅ {sku}: Eladható készlet nélkül (continue) - VAN készlet!")
+                else:
+                    unavailable_skus.append(sku)
+                    logger.info(f"  ❌ {sku}: NEM eladható (deny) - NINCS készlet!")
             else:
                 failed_count += 1
     
+    # ========== ÖNELLENŐRZÉS - MÓDOSÍTOTT TERMÉKEK ==========
     logger.info("=" * 60)
+    logger.info("📋 ÖNELLENŐRZÉS - MÓDOSÍTOTT TERMÉKEK:")
+    logger.info("=" * 60)
+    
+    if available_skus:
+        logger.info(f"\n✅ RENDELHETŐ - Készlet van ({len(available_skus)} db):")
+        logger.info("   (Eladható készlet nélkül = IGEN → lehet backorder)")
+        for sku in sorted(available_skus)[:50]:
+            logger.info(f"   - {sku}")
+        if len(available_skus) > 50:
+            logger.info(f"   ... és további {len(available_skus) - 50} termék")
+    
+    if unavailable_skus:
+        logger.info(f"\n❌ NEM RENDELHETŐ - Nincs készlet ({len(unavailable_skus)} db):")
+        logger.info("   (Eladható készlet nélkül = NEM → backorder tiltva)")
+        for sku in sorted(unavailable_skus)[:50]:
+            logger.info(f"   - {sku}")
+        if len(unavailable_skus) > 50:
+            logger.info(f"   ... és további {len(unavailable_skus) - 50} termék")
+    
+    logger.info("\n" + "=" * 60)
     logger.info(f"✅ Sync complete!")
     logger.info(f"   Updated: {updated_count} variants")
     logger.info(f"   Failed: {failed_count} variants")
