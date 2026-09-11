@@ -7,14 +7,12 @@ Automatikusan letölti az O'Neal inventory CSV-t az FTP-ről,
 
 import os
 import sys
-import json
 import ftplib
 import csv
 import logging
 from io import StringIO
 from datetime import datetime
 import requests
-import base64
 
 # Logging setup
 logging.basicConfig(
@@ -32,6 +30,7 @@ ONEAL_FTP_FILE = os.getenv('ONEAL_FTP_FILE', '/download/inventories_12019_ONeal_
 SHOPIFY_STORE = os.getenv('SHOPIFY_STORE')
 SHOPIFY_CLIENT_ID = os.getenv('SHOPIFY_CLIENT_ID')
 SHOPIFY_CLIENT_SECRET = os.getenv('SHOPIFY_CLIENT_SECRET')
+
 
 class ShopifyAPI:
     """Shopify Admin API wrapper - OAuth2 Client Credentials"""
@@ -85,7 +84,7 @@ class ShopifyAPI:
     def get_products(self):
         """Get all products from Shopify"""
         if not self.access_token:
-            logger.error("No access token available")
+            logger.error("❌ No access token available")
             return False
         
         url = f"{self.base_url}/products.json"
@@ -111,7 +110,7 @@ class ShopifyAPI:
         
         payload = {
             'variant': {
-                'inventory_policy': policy  # 'continue' or 'deny'
+                'inventory_policy': policy
             }
         }
         
@@ -120,8 +119,9 @@ class ShopifyAPI:
             response.raise_for_status()
             return True
         except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Failed to update inventory policy: {e}")
+            logger.error(f"❌ Failed to update inventory policy for variant {variant_id}: {e}")
             return False
+
 
 class ONealFTPSync:
     """O'Neal FTP inventory synchronizer"""
@@ -140,24 +140,11 @@ class ONealFTPSync:
             ftp.login(self.user, self.password)
             logger.info(f"✅ Connected to FTP: {self.host}")
             
-            # Find the file
-            files = ftp.nlst(self.filename.rsplit('/', 1)[0])
-            matching_file = None
-            
-            for f in files:
-                if 'inventories_12019' in f and 'ONeal' in f:
-                    matching_file = f
-                    break
-            
-            if not matching_file:
-                matching_file = self.filename
-            
-            # Download file
             csv_data = StringIO()
-            ftp.retrlines(f'RETR {matching_file}', csv_data.write)
+            ftp.retrlines(f'RETR {self.filename}', csv_data.write)
             ftp.quit()
             
-            logger.info(f"✅ Downloaded inventory file: {matching_file}")
+            logger.info(f"✅ Downloaded inventory file: {self.filename}")
             return csv_data.getvalue()
         
         except ftplib.all_errors as e:
@@ -169,17 +156,28 @@ class ONealFTPSync:
         try:
             reader = csv.DictReader(StringIO(csv_content), delimiter=';')
             
+            if reader.fieldnames is None:
+                logger.error("❌ CSV is empty or invalid")
+                return False
+            
+            row_count = 0
             for row in reader:
                 item_number = row.get('item_number', '').strip()
-                stock = int(row.get('stock', 0))
+                stock_str = row.get('stock', '0').strip()
+                
+                try:
+                    stock = int(stock_str)
+                except ValueError:
+                    stock = 0
                 
                 if item_number:
                     self.inventory_data[item_number] = {
                         'stock': stock,
                         'has_stock': stock > 0
                     }
+                    row_count += 1
             
-            logger.info(f"✅ Parsed {len(self.inventory_data)} items from inventory")
+            logger.info(f"✅ Parsed {row_count} items from inventory")
             return True
         
         except Exception as e:
@@ -189,6 +187,7 @@ class ONealFTPSync:
     def get_stock_status(self, sku):
         """Get stock status for SKU"""
         return self.inventory_data.get(sku, {}).get('has_stock', False)
+
 
 def main():
     """Main sync function"""
@@ -229,11 +228,21 @@ def main():
     
     # Sync inventory
     updated_count = 0
+    skipped_count = 0
+    
     for product in shopify.products:
         for variant in product.get('variants', []):
-           sku = str(variant.get('sku') or '').strip()
+            sku = variant.get('sku')
+            
+            # Handle None or empty SKU
+            if not sku:
+                skipped_count += 1
+                continue
+            
+            sku = str(sku).strip()
             
             if not sku:
+                skipped_count += 1
                 continue
             
             # Check O'Neal stock
@@ -249,10 +258,13 @@ def main():
                 logger.info(f"  {sku}: {status}")
     
     logger.info("=" * 60)
-    logger.info(f"✅ Sync complete! Updated {updated_count} variants")
+    logger.info(f"✅ Sync complete!")
+    logger.info(f"   Updated: {updated_count} variants")
+    logger.info(f"   Skipped: {skipped_count} variants (no SKU)")
     logger.info("=" * 60)
     
     return True
+
 
 if __name__ == '__main__':
     success = main()
