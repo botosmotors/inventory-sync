@@ -12,9 +12,7 @@ Logic:
 import os
 import sys
 import ftplib
-import csv
 import logging
-from io import StringIO
 from datetime import datetime
 import requests
 
@@ -105,11 +103,7 @@ class ShopifyAPI:
             return False
     
     def update_inventory_policy(self, product_id, variant_id, policy):
-        """
-        Update inventory policy
-        policy = "deny"     (NE eladható készlet nélkül - stock > 0)
-        policy = "continue" (ELADHATÓ készlet nélkül - stock = 0)
-        """
+        """Update inventory policy"""
         if not self.access_token:
             return False
         
@@ -148,92 +142,70 @@ class ONealFTPSync:
             ftp.login(self.user, self.password)
             logger.info(f"✅ Connected to FTP: {self.host}")
             
-            csv_data = StringIO()
-            ftp.retrlines(f'RETR {self.filename}', csv_data.write)
+            data = []
+            ftp.retrlines(f'RETR {self.filename}', data.append)
             ftp.quit()
             
+            csv_content = '\n'.join(data)
             logger.info(f"✅ Downloaded inventory file: {self.filename}")
-            return csv_data.getvalue()
+            return csv_content
         
         except ftplib.all_errors as e:
             logger.error(f"❌ FTP error: {e}")
             return None
     
-    def detect_delimiter(self, csv_content):
-        """Detect CSV delimiter (;, tab, comma, space)"""
-        lines = csv_content.split('\n')
-        
-        # Find header line (contains 'item_number')
-        header_line = None
-        for line in lines:
-            if 'item_number' in line:
-                header_line = line
-                break
-        
-        if not header_line:
-            logger.warning("⚠️ Could not find 'item_number' in CSV - using default delimiter ';'")
-            return ';'
-        
-        delimiters = [';', '\t', ',', ' ']
-        delimiter = ';'  # default
-        
-        for delim in delimiters:
-            if delim in header_line:
-                delimiter = delim
-                logger.info(f"✅ Detected CSV delimiter: {repr(delimiter)}")
-                break
-        
-        return delimiter
-    
     def parse_inventory(self, csv_content):
-        """Parse CSV and extract stock data"""
+        """Parse CSV and extract stock data - robust parsing"""
         try:
-            # Remove BOM if present
-            if csv_content.startswith('\ufeff'):
-                csv_content = csv_content[1:]
-            
-            # Auto-detect delimiter
-            delimiter = self.detect_delimiter(csv_content)
-            
-            # Find header line and start from there
             lines = csv_content.split('\n')
+            
+            if not lines:
+                logger.error("❌ CSV is empty")
+                return False
+            
+            # Find header line (contains 'item_number')
+            header_line = None
             header_idx = -1
             
             for i, line in enumerate(lines):
-                if 'item_number' in line:
+                if 'item_number' in line.lower():
+                    header_line = line
                     header_idx = i
                     break
             
             if header_idx == -1:
-                logger.error("❌ Could not find header row with 'item_number'")
+                logger.error("❌ Could not find header with 'item_number'")
                 return False
             
-            # Parse from header line onwards
-            csv_lines = '\n'.join(lines[header_idx:])
-            reader = csv.DictReader(StringIO(csv_lines), delimiter=delimiter)
+            logger.info(f"✅ Found header at line {header_idx}: {header_line[:100]}")
             
-            if reader.fieldnames is None:
-                logger.error("❌ CSV is empty or invalid")
-                return False
-            
-            logger.info(f"✅ CSV header fields: {reader.fieldnames}")
-            
+            # Parse data lines (from header_idx + 1 onwards)
             row_count = 0
-            for row in reader:
-                item_number = row.get('item_number', '').strip()
-                stock_str = row.get('stock', '0').strip()
+            
+            for i in range(header_idx + 1, len(lines)):
+                line = lines[i].strip()
                 
-                try:
-                    stock = int(stock_str)
-                except ValueError:
-                    stock = 0
+                if not line:
+                    continue
                 
-                if item_number:
-                    self.inventory_data[item_number] = {
-                        'stock': stock,
-                        'has_stock': stock > 0
-                    }
-                    row_count += 1
+                # Simple split by semicolon
+                parts = line.split(';')
+                
+                if len(parts) >= 2:
+                    item_number = parts[0].strip()
+                    stock_str = parts[1].strip()
+                    
+                    if item_number:
+                        try:
+                            stock = int(stock_str)
+                        except ValueError:
+                            stock = 0
+                        
+                        self.inventory_data[item_number] = {
+                            'stock': stock,
+                            'has_stock': stock > 0
+                        }
+                        row_count += 1
             
             logger.info(f"✅ Parsed {row_count} items from inventory")
             return True
@@ -243,7 +215,7 @@ class ONealFTPSync:
             return False
     
     def get_stock_status(self, sku):
-        """Get stock status for SKU - returns has_stock boolean"""
+        """Get stock status for SKU"""
         return self.inventory_data.get(sku, {}).get('has_stock', False)
 
 
@@ -293,7 +265,6 @@ def main():
         for variant in product.get('variants', []):
             sku = variant.get('sku')
             
-            # Handle None or empty SKU
             if not sku:
                 skipped_count += 1
                 continue
@@ -307,9 +278,7 @@ def main():
             # Check O'Neal stock
             has_stock = oneal.get_stock_status(sku)
             
-            # Determine policy:
-            # - has_stock (stock > 0)  → "deny"     (NE eladható készlet nélkül)
-            # - NO stock (stock = 0)   → "continue" (ELADHATÓ készlet nélkül)
+            # Determine policy
             policy = "deny" if has_stock else "continue"
             
             # Update Shopify
