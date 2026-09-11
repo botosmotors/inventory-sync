@@ -231,7 +231,7 @@ def main():
     updated_count = 0
     for product in shopify.products:
         for variant in product.get('variants', []):
-            sku = variant.get('sku', '').strip()
+           sku = str(variant.get('sku') or '').strip()
             
             if not sku:
                 continue
