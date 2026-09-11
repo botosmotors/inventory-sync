@@ -217,10 +217,32 @@ class ONealFTPSync:
             
             logger.info(f"✅ Parsed {row_count} items from inventory")
             
+            # EXPORT az parsed inventory-t CSV-be debugginghoz
+            try:
+                import csv
+                with open('/tmp/parsed_inventory.csv', 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f, delimiter=';')
+                    writer.writerow(['item_number', 'stock', 'has_stock'])
+                    for sku, data in sorted(self.inventory_data.items()):
+                        writer.writerow([sku, data['stock'], data['has_stock']])
+                logger.info(f"✅ Exported parsed inventory to: /tmp/parsed_inventory.csv")
+            except Exception as e:
+                logger.warning(f"⚠️ Could not export inventory CSV: {e}")
+            
             # DEBUG: Kiírja az első 20 parsolt SKU-t
             logger.info(f"🔍 DEBUG - Első 20 parsolt SKU:")
             for i, (sku, data) in enumerate(list(self.inventory_data.items())[:20]):
                 logger.info(f"   {i+1}. {sku} → stock={data.get('stock')}")
+            
+            # DEBUG: Keresés az 0625-516-ra
+            if '0625-516' in self.inventory_data:
+                logger.info(f"✅ 0625-516 MEGTALÁLVA: {self.inventory_data['0625-516']}")
+            else:
+                logger.warning(f"❌ 0625-516 NINCS az inventory_data-ban!")
+                # Próbáljunk whitespace-el keresni
+                for sku in list(self.inventory_data.keys()):
+                    if '0625' in sku and '516' in sku:
+                        logger.info(f"   💡 De MEGTALÁLTAM: '{sku}' → {self.inventory_data[sku]}")
             
             return True
         
