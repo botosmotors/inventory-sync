@@ -341,11 +341,20 @@ def main():
                 continue
             
             has_stock = oneal.get_stock_status(sku)
+            actual_stock = oneal.inventory_data[sku]['stock']
+            
+            # DEBUG: Ha 0625-516, kiírja a detailokat
+            if '0625-516' in sku:
+                logger.info(f"🔍 DEBUG {sku}: actual_stock={actual_stock}, has_stock={has_stock}")
             
             # HELYES LOGIKA:
             # stock > 0 → "continue" (LEHET backorder - eladható készlet nélkül)
             # stock = 0 → "deny"     (NE lehessen backorder - nem eladható)
             policy = "continue" if has_stock else "deny"
+            
+            # DEBUG: Ha 0625-516, kiírja a policy-t
+            if '0625-516' in sku:
+                logger.info(f"🔍 DEBUG {sku}: policy={policy}")
             
             # Update Shopify
             if shopify.update_inventory_policy(product['id'], variant['id'], policy):
