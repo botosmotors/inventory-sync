@@ -14,7 +14,7 @@ import logging
 from io import StringIO
 from datetime import datetime
 import requests
-from urllib.parse import urlencode
+import base64
 
 # Logging setup
 logging.basicConfig(
@@ -34,81 +34,47 @@ SHOPIFY_CLIENT_ID = os.getenv('SHOPIFY_CLIENT_ID')
 SHOPIFY_CLIENT_SECRET = os.getenv('SHOPIFY_CLIENT_SECRET')
 
 class ShopifyAPI:
-    """Shopify Admin API wrapper"""
+    """Shopify Admin API wrapper - Basic Auth"""
     
     def __init__(self, store, client_id, client_secret):
         self.store = store
         self.client_id = client_id
         self.client_secret = client_secret
-        self.access_token = None
-        self.authenticate()
+        self.api_version = "2024-10"
+        self.base_url = f"https://{self.store}/admin/api/{self.api_version}"
+        self.products = []
     
-    def authenticate(self):
-        """Get OAuth access token"""
-        url = f"https://{self.store}/admin/oauth/access_tokens"
-        payload = {
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'grant_type': 'client_credentials',
-            'scope': 'write_inventory,read_inventory,read_products'
+    def get_auth_header(self):
+        """Get Basic Auth header from client credentials"""
+        credentials = f"{self.client_id}:{self.client_secret}"
+        encoded = base64.b64encode(credentials.encode()).decode()
+        return {
+            'Authorization': f'Basic {encoded}',
+            'Content-Type': 'application/json'
         }
-        
-        try:
-            response = requests.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            self.access_token = data.get('access_token')
-            logger.info("✅ Shopify OAuth authentication successful")
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Shopify authentication failed: {e}")
-            return False
     
     def get_products(self):
         """Get all products from Shopify"""
-        if not self.access_token:
-            logger.error("No access token available")
-            return []
+        url = f"{self.base_url}/products.json"
+        headers = self.get_auth_header()
         
-        url = f"https://{self.store}/admin/api/2024-10/products.json"
-        headers = {
-            'X-Shopify-Access-Token': self.access_token
-        }
-        
-        products = []
         try:
             response = requests.get(url, headers=headers)
             response.raise_for_status()
-            products = response.json().get('products', [])
-            logger.info(f"✅ Fetched {len(products)} products from Shopify")
+            self.products = response.json().get('products', [])
+            logger.info(f"✅ Fetched {len(self.products)} products from Shopify")
+            return True
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Failed to fetch products: {e}")
-        
-        return products
-    
-    def get_product_by_sku(self, sku):
-        """Get product by SKU"""
-        products = self.get_products()
-        for product in products:
-            for variant in product.get('variants', []):
-                if variant.get('sku') == sku:
-                    return product, variant
-        return None, None
+            return False
     
     def update_inventory_policy(self, product_id, variant_id, policy):
         """Update inventory policy (continue or deny)"""
-        if not self.access_token:
-            return False
-        
-        url = f"https://{self.store}/admin/api/2024-10/products/{product_id}/variants/{variant_id}.json"
-        headers = {
-            'X-Shopify-Access-Token': self.access_token,
-            'Content-Type': 'application/json'
-        }
+        url = f"{self.base_url}/products/{product_id}/variants/{variant_id}.json"
+        headers = self.get_auth_header()
         
         payload = {
             'variant': {
-                'id': variant_id,
                 'inventory_policy': policy  # 'continue' or 'deny'
             }
         }
@@ -116,7 +82,6 @@ class ShopifyAPI:
         try:
             response = requests.put(url, headers=headers, json=payload)
             response.raise_for_status()
-            logger.info(f"✅ Updated variant {variant_id} inventory policy to '{policy}'")
             return True
         except requests.exceptions.RequestException as e:
             logger.error(f"❌ Failed to update inventory policy: {e}")
@@ -217,14 +182,13 @@ def main():
         return False
     
     # Get Shopify products
-    products = shopify.get_products()
-    if not products:
+    if not shopify.get_products():
         logger.error("❌ Failed to fetch Shopify products")
         return False
     
     # Sync inventory
     updated_count = 0
-    for product in products:
+    for product in shopify.products:
         for variant in product.get('variants', []):
             sku = variant.get('sku', '').strip()
             
