@@ -328,6 +328,18 @@ def main():
                 continue
             
             # Check O'Neal stock
+            # ⚠️ FONTOS: Csak az O'Neal-ben megtalálható SKU-kat módosítunk!
+            if sku not in oneal.inventory_data:
+                skipped_count += 1
+                skip_reason = f"SKU nincs az O'Neal készletben: {sku}"
+                skipped_items.append({
+                    'product': product_title,
+                    'variant': variant_title,
+                    'reason': skip_reason,
+                    'variant_id': variant.get('id')
+                })
+                continue
+            
             has_stock = oneal.get_stock_status(sku)
             
             # HELYES LOGIKA:
