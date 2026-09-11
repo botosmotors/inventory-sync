@@ -161,15 +161,26 @@ class ONealFTPSync:
     
     def detect_delimiter(self, csv_content):
         """Detect CSV delimiter (;, tab, comma, space)"""
-        first_line = csv_content.split('\n')[0] if csv_content else ""
+        lines = csv_content.split('\n')
+        
+        # Find header line (contains 'item_number')
+        header_line = None
+        for line in lines:
+            if 'item_number' in line:
+                header_line = line
+                break
+        
+        if not header_line:
+            logger.warning("⚠️ Could not find 'item_number' in CSV - using default delimiter ';'")
+            return ';'
         
         delimiters = [';', '\t', ',', ' ']
         delimiter = ';'  # default
         
         for delim in delimiters:
-            if delim in first_line:
+            if delim in header_line:
                 delimiter = delim
-                logger.info(f"✅ Detected CSV delimiter: '{repr(delimiter)}'")
+                logger.info(f"✅ Detected CSV delimiter: {repr(delimiter)}")
                 break
         
         return delimiter
@@ -177,16 +188,35 @@ class ONealFTPSync:
     def parse_inventory(self, csv_content):
         """Parse CSV and extract stock data"""
         try:
+            # Remove BOM if present
+            if csv_content.startswith('\ufeff'):
+                csv_content = csv_content[1:]
+            
             # Auto-detect delimiter
             delimiter = self.detect_delimiter(csv_content)
             
-            reader = csv.DictReader(StringIO(csv_content), delimiter=delimiter)
+            # Find header line and start from there
+            lines = csv_content.split('\n')
+            header_idx = -1
+            
+            for i, line in enumerate(lines):
+                if 'item_number' in line:
+                    header_idx = i
+                    break
+            
+            if header_idx == -1:
+                logger.error("❌ Could not find header row with 'item_number'")
+                return False
+            
+            # Parse from header line onwards
+            csv_lines = '\n'.join(lines[header_idx:])
+            reader = csv.DictReader(StringIO(csv_lines), delimiter=delimiter)
             
             if reader.fieldnames is None:
                 logger.error("❌ CSV is empty or invalid")
                 return False
             
-            logger.info(f"CSV fields: {reader.fieldnames}")
+            logger.info(f"✅ CSV header fields: {reader.fieldnames}")
             
             row_count = 0
             for row in reader:
