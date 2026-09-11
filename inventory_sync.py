@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-O'Neal FTP Inventory to Shopify Sync V7 FINAL
-AUTOMATA + ÖNELLENŐRZÉS (listázza a módosított termékeket)
+O'Neal FTP Inventory to Shopify Sync V8 PLUS
+AUTOMATA + TELJES ÖNELLENŐRZÉS (listázza az ÖSSZES módosítást + skipped termékeket + SKIP OKOK)
 
 HELYES LOGIKA:
 - Ha stock > 0  → inventory_policy = "continue" (LEHET backorder - eladható készlet nélkül)
@@ -225,7 +225,7 @@ class ONealFTPSync:
 def main():
     """Main sync function"""
     logger.info("=" * 60)
-    logger.info("🚀 O'Neal FTP to Shopify Inventory Sync V7 FINAL Started")
+    logger.info("🚀 O'Neal FTP to Shopify Inventory Sync V8 PLUS Started")
     logger.info(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
     
@@ -267,19 +267,38 @@ def main():
     # Listázáshoz
     available_skus = []      # stock > 0 → continue (eladható készlet nélkül)
     unavailable_skus = []    # stock = 0 → deny (nem eladható)
+    skipped_items = []       # SKU nélküli variánsok + oka
     
     for product in shopify.products:
+        product_title = product.get('title', 'Unknown')
+        
         for variant in product.get('variants', []):
             sku = variant.get('sku')
+            variant_title = variant.get('title', 'Unknown')
             
-            if not sku:
+            # SKIP OK: Nincs SKU
+            if not sku or (isinstance(sku, str) and not sku.strip()):
                 skipped_count += 1
+                skip_reason = "Nincs SKU feltöltve a Shopify-ban"
+                skipped_items.append({
+                    'product': product_title,
+                    'variant': variant_title,
+                    'reason': skip_reason,
+                    'variant_id': variant.get('id')
+                })
                 continue
             
             sku = str(sku).strip()
             
             if not sku:
                 skipped_count += 1
+                skip_reason = "SKU üres vagy nem olvasható"
+                skipped_items.append({
+                    'product': product_title,
+                    'variant': variant_title,
+                    'reason': skip_reason,
+                    'variant_id': variant.get('id')
+                })
                 continue
             
             # Check O'Neal stock
@@ -295,21 +314,20 @@ def main():
                 updated_count += 1
                 if has_stock:
                     available_skus.append(sku)
-                    logger.info(f"  ✅ {sku}: Eladható készlet nélkül (continue) - VAN készlet!")
+                    logger.info(f"  ✅ {sku}: Eladható készlet nélkül (continue)")
                 else:
                     unavailable_skus.append(sku)
-                    logger.info(f"  ❌ {sku}: NEM eladható (deny) - NINCS készlet!")
+                    logger.info(f"  ❌ {sku}: NEM eladható (deny)")
             else:
                 failed_count += 1
     
-    # ========== ÖNELLENŐRZÉS - MÓDOSÍTOTT TERMÉKEK ==========
+    # ========== TELJES ÖNELLENŐRZÉS ==========
     logger.info("=" * 60)
-    logger.info("📋 ÖNELLENŐRZÉS - MÓDOSÍTOTT TERMÉKEK:")
+    logger.info("📋 TELJES ÖNELLENŐRZÉS - MÓDOSÍTOTT + SKIPPED:")
     logger.info("=" * 60)
     
     if available_skus:
         logger.info(f"\n✅ RENDELHETŐ - Készlet van ({len(available_skus)} db):")
-        logger.info("   (Eladható készlet nélkül = IGEN → lehet backorder)")
         for sku in sorted(available_skus)[:50]:
             logger.info(f"   - {sku}")
         if len(available_skus) > 50:
@@ -317,17 +335,38 @@ def main():
     
     if unavailable_skus:
         logger.info(f"\n❌ NEM RENDELHETŐ - Nincs készlet ({len(unavailable_skus)} db):")
-        logger.info("   (Eladható készlet nélkül = NEM → backorder tiltva)")
         for sku in sorted(unavailable_skus)[:50]:
             logger.info(f"   - {sku}")
         if len(unavailable_skus) > 50:
             logger.info(f"   ... és további {len(unavailable_skus) - 50} termék")
     
+    if skipped_items:
+        logger.info(f"\n⚠️  SKIPPED - MIÉRT NEM MÓDOSÍTOTT ({len(skipped_items)} db):")
+        logger.info("   " + "=" * 55)
+        
+        # Csoportosítás oka szerint
+        reasons_dict = {}
+        for item in skipped_items:
+            reason = item.get('reason', 'Ismeretlen ok')
+            if reason not in reasons_dict:
+                reasons_dict[reason] = []
+            reasons_dict[reason].append(item)
+        
+        for reason, items in reasons_dict.items():
+            logger.info(f"\n   🔴 OK: {reason}")
+            logger.info(f"      Érintett termékek ({len(items)} db):")
+            for item in items[:15]:
+                product = item.get('product', 'Unknown')
+                variant = item.get('variant', 'Unknown')
+                logger.info(f"      - {product} / {variant}")
+            if len(items) > 15:
+                logger.info(f"      ... és további {len(items) - 15} termék")
+    
     logger.info("\n" + "=" * 60)
     logger.info(f"✅ Sync complete!")
     logger.info(f"   Updated: {updated_count} variants")
     logger.info(f"   Failed: {failed_count} variants")
-    logger.info(f"   Skipped: {skipped_count} variants (no SKU)")
+    logger.info(f"   Skipped: {skipped_count} variants (SKIP OKOK: lásd fent!)")
     logger.info("=" * 60)
     
     return True
