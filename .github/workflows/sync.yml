@@ -1,35 +1,40 @@
-name: Inventory Sync
+name: O'Neal inventory sync
 
 on:
   schedule:
-    - cron: '0 0,6,12,18 * * *'
+    - cron: '7 */6 * * *'   # 6 óránként (UTC)
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Csak teszt (nem módosít semmit)?'
+        type: choice
+        options: ['true', 'false']
+        default: 'true'
+
+concurrency:
+  group: oneal-sync
+  cancel-in-progress: false
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 30
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-      
-      - name: Set up Python
-        uses: actions/setup-python@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-      
-      - name: Run inventory sync
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - name: Sync
         env:
           ONEAL_FTP_HOST: ${{ secrets.ONEAL_FTP_HOST }}
           ONEAL_FTP_USER: ${{ secrets.ONEAL_FTP_USER }}
           ONEAL_FTP_PASSWORD: ${{ secrets.ONEAL_FTP_PASSWORD }}
-          ONEAL_FTP_FILE: '/download/inventories_12019_ONeal_Europe.csv'
+          ONEAL_FTP_FILE: ${{ secrets.ONEAL_FTP_FILE }}
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           SHOPIFY_CLIENT_ID: ${{ secrets.SHOPIFY_CLIENT_ID }}
           SHOPIFY_CLIENT_SECRET: ${{ secrets.SHOPIFY_CLIENT_SECRET }}
-        run: |
-          python inventory_sync.py
+          # kézi indításnál a választott érték, időzített futásnál éles (false)
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+          DENY_MISSING: 'true'
+        run: python inventory_sync.py
