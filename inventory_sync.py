@@ -12,6 +12,7 @@ Mit csinál:
     nincs az O'Neal listában     -> DENY     (kifutott méret; kikapcsolható: DENY_MISSING=false)
 - CSAK akkor ír a Shopify-ba, ha az érték tényleg változik (gyors, nem fut bele a limitekbe)
 - Vázlat (draft) és archivált termékekhez nem nyúl
+- Close-out termékekhez nem nyúl: Outlet kollekció, vagy "akció"/"akciós" a termék nevében
 - A saját raktárkészletet nem módosítja (csak az inventory policy-t)
 
 V9-hez képest javítva:
@@ -54,6 +55,9 @@ API_VERSION = os.getenv('SHOPIFY_API_VERSION') or '2026-01'
 VENDOR = os.getenv('VENDOR') or 'Oneal'                    # Shopify "Szállító" mező értéke
 DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # true = csak kiírja, nem módosít
 DENY_MISSING = os.getenv('DENY_MISSING', 'true').lower() == 'true'
+# Kizárt termékek (close-out / outlet): ezekhez a script NEM nyúl
+EXCLUDE_COLLECTIONS = [c.strip().lower() for c in (os.getenv('EXCLUDE_COLLECTIONS') or 'outlet').split(',') if c.strip()]
+EXCLUDE_TITLE_REGEX = os.getenv('EXCLUDE_TITLE_REGEX') or r'\bakci[oó]|\bakc[oó]\b'
 
 
 # ---------------------------------------------------------------- O'Neal FTP
@@ -156,6 +160,7 @@ class Shopify:
             pageInfo { hasNextPage endCursor }
             nodes {
               id title status vendor
+              collections(first: 25) { nodes { handle } }
               variants(first: 100) {
                 nodes { id title sku barcode inventoryPolicy }
               }
@@ -212,10 +217,21 @@ def main():
     products = shop.oneal_products()
 
     stats = {'match_sku': 0, 'match_ean': 0, 'not_found': 0, 'no_id': 0,
-             'to_continue': 0, 'to_deny': 0, 'unchanged': 0, 'failed': 0}
+             'to_continue': 0, 'to_deny': 0, 'unchanged': 0, 'failed': 0, 'excluded': 0}
     changed_log, not_found_log, no_id_log, fix_log = [], [], [], []
 
+    excluded_log = []
     for p in products:
+        handles = [c['handle'].lower() for c in p.get('collections', {}).get('nodes', [])]
+        why = None
+        if any(h in EXCLUDE_COLLECTIONS for h in handles):
+            why = 'Outlet kollekció'
+        elif re.search(EXCLUDE_TITLE_REGEX, p['title'], re.I):
+            why = 'akciós a névben'
+        if why:
+            stats['excluded'] += len(p['variants']['nodes'])
+            excluded_log.append(f"{p['title']} ({why})")
+            continue
         changes = []
         for v in p['variants']['nodes']:
             sku = (v['sku'] or '').strip()
@@ -271,6 +287,10 @@ def main():
         log.info("  " + line)
     if not changed_log:
         log.info("  Nincs változás az előző futáshoz képest.")
+    if excluded_log:
+        log.info(f"\n🏷️  Kizárva – close-out / outlet, nem módosítva ({len(excluded_log)} termék):")
+        for line in excluded_log:
+            log.info("  - " + line)
     if fix_log:
         log.info(f"\n🔧 Elírt SKU, javítva párosítva – érdemes a Shopify-ban is átírni ({len(fix_log)} db):")
         for line in fix_log:
@@ -288,7 +308,7 @@ def main():
     summary = (f"Párosítva SKU-val: {stats['match_sku']}, EAN-nal: {stats['match_ean']} | "
                f"Nem található: {stats['not_found']} | Azonosító nélkül: {stats['no_id']} | "
                f"Módosítva → rendelhető: {stats['to_continue']}, → nem rendelhető: {stats['to_deny']} | "
-               f"Változatlan: {stats['unchanged']} | Hiba: {stats['failed']}")
+               f"Változatlan: {stats['unchanged']} | Kizárt (outlet/akció): {stats['excluded']} | Hiba: {stats['failed']}")
     log.info("\n" + "=" * 60)
     log.info(("[DRY RUN] " if DRY_RUN else "✅ ") + summary)
     log.info("=" * 60)
@@ -300,7 +320,7 @@ def main():
             f.write("| | db |\n|---|---|\n")
             for k, label in [('match_sku', 'Párosítva SKU-val'), ('match_ean', 'Párosítva EAN-nal'),
                              ('to_continue', 'Módosítva → rendelhető'), ('to_deny', 'Módosítva → nem rendelhető'),
-                             ('unchanged', 'Változatlan'), ('not_found', "Nincs az O'Neal listában"),
+                             ('unchanged', 'Változatlan'), ('excluded', 'Kizárt (outlet/akciós, nem módosítva)'), ('not_found', "Nincs az O'Neal listában"),
                              ('no_id', 'Nincs SKU és vonalkód'), ('failed', 'Hiba')]:
                 f.write(f"| {label} | {stats[k]} |\n")
             if fix_log:
