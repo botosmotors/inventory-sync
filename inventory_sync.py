@@ -275,7 +275,9 @@ def main():
 
             # elérhetőség a javaslatokhoz: O'Neal készlet VAGY saját raktárkészlet
             own = v.get('inventoryQuantity') or 0
-            if rec or own > 0:
+            # nincs az O'Neal listában (kifutott méret), de van azonosítója -> elfogyottnak számít
+            missing_but_known = not rec and (sku or bars) and DENY_MISSING
+            if rec or own > 0 or missing_but_known:
                 n_known += 1
                 if (rec and rec['stock'] > 0) or own > 0:
                     avail_sizes.append(v['title'])
