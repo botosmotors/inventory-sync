@@ -213,7 +213,7 @@ def main():
 
     stats = {'match_sku': 0, 'match_ean': 0, 'not_found': 0, 'no_id': 0,
              'to_continue': 0, 'to_deny': 0, 'unchanged': 0, 'failed': 0}
-    changed_log, not_found_log, no_id_log = [], [], []
+    changed_log, not_found_log, no_id_log, fix_log = [], [], [], []
 
     for p in products:
         changes = []
@@ -221,6 +221,13 @@ def main():
             sku = (v['sku'] or '').strip()
             bars = [b.strip() for b in re.split(r'[;,\s]+', v['barcode'] or '') if b.strip()]
             rec = by_sku.get(sku) if sku else None
+            if not rec and sku:
+                # gyakori elírás: Excel levágja a vezető nullát (339-111 -> 0339-111), kis/nagybetű
+                for alt in ('0' + sku, sku.upper(), ('0' + sku).upper()):
+                    if alt in by_sku:
+                        rec = by_sku[alt]
+                        fix_log.append(f"{p['title']} / {v['title']}: {sku} → {alt}")
+                        break
             if rec:
                 stats['match_sku'] += 1
             else:
@@ -264,6 +271,10 @@ def main():
         log.info("  " + line)
     if not changed_log:
         log.info("  Nincs változás az előző futáshoz képest.")
+    if fix_log:
+        log.info(f"\n🔧 Elírt SKU, javítva párosítva – érdemes a Shopify-ban is átírni ({len(fix_log)} db):")
+        for line in fix_log:
+            log.info("  - " + line)
     if not_found_log:
         log.info(f"\n⚠️  Nincs az O'Neal listában ({len(not_found_log)} db)"
                  f"{' → nem rendelhetőre állítva' if DENY_MISSING else ' → kihagyva'}:")
@@ -292,6 +303,8 @@ def main():
                              ('unchanged', 'Változatlan'), ('not_found', "Nincs az O'Neal listában"),
                              ('no_id', 'Nincs SKU és vonalkód'), ('failed', 'Hiba')]:
                 f.write(f"| {label} | {stats[k]} |\n")
+            if fix_log:
+                f.write("\n### Elírt SKU-k (javítsd a Shopify-ban)\n" + "\n".join(f"- {l}" for l in fix_log) + "\n")
             if changed_log:
                 f.write("\n### Változások\n" + "\n".join(f"- {l}" for l in changed_log[:300]) + "\n")
 
