@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-O'Neal FTP -> Shopify készlet szinkron  V10
+O'Neal FTP -> Shopify készlet szinkron  V11
 
 Mit csinál:
 - Letölti az O'Neal készletfájlt FTP-ről (item_number;stock;EAN;next_delivery;active)
@@ -14,6 +14,13 @@ Mit csinál:
 - Vázlat (draft) és archivált termékekhez nem nyúl
 - Close-out termékekhez nem nyúl: Outlet kollekció, vagy "akció"/"akciós" a termék nevében
 - A saját raktárkészletet nem módosítja (csak az inventory policy-t)
+- JAVASLATOK (V11) – a termék státuszát SOSEM módosítja, csak listázza:
+    aktív termék, minden mérete elfogyott (O'Neal 0 + saját készlet 0) -> "javasolt levenni"
+    aktív termék, a méretek kevesebb mint MIN_AVAILABLE_RATIO-ja (alap: 50%) elérhető
+        -> "kevés méret maradt, javasolt levenni" (pl. 5-ből 2)
+    draft termék, legalább MIN_SIZES_TO_ACTIVATE (alap: 3) mérete ÉS legalább
+        MIN_AVAILABLE_RATIO-ja elérhető -> "javasolt aktiválni"
+    (a két szabály ugyanazt az arányt használja, így egy termék nem ugrál a két lista között)
 
 V9-hez képest javítva:
 - ">10" készletérték eddig 0-nak számított -> minden ilyen változat "nem rendelhető" lett. JAVÍTVA.
@@ -58,6 +65,10 @@ DENY_MISSING = os.getenv('DENY_MISSING', 'true').lower() == 'true'
 # Kizárt termékek (close-out / outlet): ezekhez a script NEM nyúl
 EXCLUDE_COLLECTIONS = [c.strip().lower() for c in (os.getenv('EXCLUDE_COLLECTIONS') or 'outlet').split(',') if c.strip()]
 EXCLUDE_TITLE_REGEX = os.getenv('EXCLUDE_TITLE_REGEX') or r'\bakci[oó]|\bakc[oó]\b'
+# Javaslat: draft termék aktiválása, ha legalább ennyi mérete elérhető (1-2 méretes terméknél: mind)
+MIN_SIZES_TO_ACTIVATE = int(os.getenv('MIN_SIZES_TO_ACTIVATE') or 3)
+# Javaslat: aktív termék levétele, ha a méretek kevesebb mint ekkora hányada elérhető (0.5 = 50%)
+MIN_AVAILABLE_RATIO = float(os.getenv('MIN_AVAILABLE_RATIO') or 0.5)
 
 
 # ---------------------------------------------------------------- O'Neal FTP
@@ -162,20 +173,21 @@ class Shopify:
               id title status vendor
               collections(first: 25) { nodes { handle } }
               variants(first: 100) {
-                nodes { id title sku barcode inventoryPolicy }
+                nodes { id title sku barcode inventoryPolicy inventoryQuantity }
               }
             }
           }
         }"""
         cursor, out = None, []
         while True:
-            d = self.gql(q, {'cursor': cursor, 'q': f"vendor:'{VENDOR}' status:active"})
+            d = self.gql(q, {'cursor': cursor, 'q': f"vendor:'{VENDOR}' AND (status:active OR status:draft)"})
             page = d['products']
-            out.extend(p for p in page['nodes'] if p['vendor'] == VENDOR and p['status'] == 'ACTIVE')
+            out.extend(p for p in page['nodes'] if p['vendor'] == VENDOR and p['status'] in ('ACTIVE', 'DRAFT'))
             if not page['pageInfo']['hasNextPage']:
                 break
             cursor = page['pageInfo']['endCursor']
-        log.info(f"✅ Aktív {VENDOR} termékek a Shopify-ban: {len(out)}")
+        n_act = sum(1 for p in out if p['status'] == 'ACTIVE')
+        log.info(f"✅ {VENDOR} termékek a Shopify-ban: {n_act} aktív, {len(out) - n_act} draft")
         return out
 
     def set_policies(self, product_id, changes):
@@ -192,10 +204,15 @@ class Shopify:
             raise RuntimeError(str(errs))
 
 
+def admin_link(product_id):
+    store = (SHOPIFY_STORE or '').replace('.myshopify.com', '')
+    return f"https://admin.shopify.com/store/{store}/products/{product_id.rsplit('/', 1)[-1]}"
+
+
 # ---------------------------------------------------------------- main
 def main():
     log.info("=" * 60)
-    log.info(f"🚀 O'Neal készlet szinkron V10  {datetime.now():%Y-%m-%d %H:%M}"
+    log.info(f"🚀 O'Neal készlet szinkron V11  {datetime.now():%Y-%m-%d %H:%M}"
              f"{'   [DRY RUN – nem módosít]' if DRY_RUN else ''}")
     log.info("=" * 60)
 
@@ -221,7 +238,9 @@ def main():
     changed_log, not_found_log, no_id_log, fix_log = [], [], [], []
 
     excluded_log = []
+    suggest_off, suggest_low, suggest_on = [], [], []   # javaslatok: (title, link, részletek)
     for p in products:
+        is_draft = p['status'] == 'DRAFT'
         handles = [c['handle'].lower() for c in p.get('collections', {}).get('nodes', [])]
         why = None
         if any(h in EXCLUDE_COLLECTIONS for h in handles):
@@ -229,10 +248,12 @@ def main():
         elif re.search(EXCLUDE_TITLE_REGEX, p['title'], re.I):
             why = 'akciós a névben'
         if why:
-            stats['excluded'] += len(p['variants']['nodes'])
-            excluded_log.append(f"{p['title']} ({why})")
+            if not is_draft:
+                stats['excluded'] += len(p['variants']['nodes'])
+                excluded_log.append(f"{p['title']} ({why})")
             continue
         changes = []
+        n_known, avail_sizes, soldout_sizes = 0, [], []
         for v in p['variants']['nodes']:
             sku = (v['sku'] or '').strip()
             bars = [b.strip() for b in re.split(r'[;,\s]+', v['barcode'] or '') if b.strip()]
@@ -251,6 +272,17 @@ def main():
                 if rec:
                     stats['match_ean'] += 1
             name = f"{p['title']} / {v['title']}"
+
+            # elérhetőség a javaslatokhoz: O'Neal készlet VAGY saját raktárkészlet
+            own = v.get('inventoryQuantity') or 0
+            if rec or own > 0:
+                n_known += 1
+                if (rec and rec['stock'] > 0) or own > 0:
+                    avail_sizes.append(v['title'])
+                else:
+                    soldout_sizes.append(v['title'])
+            if is_draft:
+                continue   # draft termék változataihoz nem nyúlunk, csak a javaslathoz számoljuk
 
             if not rec:
                 if not sku and not bars:
@@ -272,6 +304,20 @@ def main():
             stats['to_continue' if target == 'CONTINUE' else 'to_deny'] += 1
             extra = f" (O'Neal: {rec['raw_stock']}, érkezik: {rec['next_delivery']})" if rec else " (nincs az O'Neal listában)"
             changed_log.append(f"{'✅ rendelhető' if target == 'CONTINUE' else '⛔ nem rendelhető'}: {name}{extra}")
+
+        # ---- javaslatok (csak listázás, a státuszt NEM módosítja) ----
+        if n_known:
+            link = admin_link(p['id'])
+            ratio = len(avail_sizes) / n_known
+            if not is_draft and not avail_sizes:
+                suggest_off.append((p['title'], link, f"{len(soldout_sizes)} méret, mind elfogyott"))
+            elif not is_draft and ratio < MIN_AVAILABLE_RATIO:
+                suggest_low.append((p['title'], link,
+                                    f"{len(avail_sizes)}/{n_known} méret elérhető ({ratio:.0%}): {', '.join(avail_sizes)}"))
+            elif (is_draft and len(avail_sizes) >= min(MIN_SIZES_TO_ACTIVATE, n_known)
+                  and ratio >= MIN_AVAILABLE_RATIO):
+                suggest_on.append((p['title'], link,
+                                   f"{len(avail_sizes)}/{n_known} méret elérhető: {', '.join(avail_sizes)}"))
 
         if changes and not DRY_RUN:
             try:
@@ -305,6 +351,23 @@ def main():
         for line in no_id_log[:100]:
             log.info("  - " + line)
 
+    log.info(f"\n💡 JAVASLAT – érdemes LEVENNI (draftba tenni), minden méret elfogyott ({len(suggest_off)} termék):")
+    for t, link, info in suggest_off:
+        log.info(f"  - {t} ({info})  {link}")
+    if not suggest_off:
+        log.info("  Nincs ilyen termék.")
+    log.info(f"\n💡 JAVASLAT – KEVÉS MÉRET maradt (< {MIN_AVAILABLE_RATIO:.0%}), érdemes levenni ({len(suggest_low)} termék):")
+    for t, link, info in suggest_low:
+        log.info(f"  - {t} ({info})  {link}")
+    if not suggest_low:
+        log.info("  Nincs ilyen termék.")
+    log.info(f"\n💡 JAVASLAT – érdemes AKTIVÁLNI, draft de van elég méret ({len(suggest_on)} termék):")
+    for t, link, info in suggest_on:
+        log.info(f"  - {t} ({info})  {link}")
+    if not suggest_on:
+        log.info("  Nincs ilyen termék.")
+    log.info("  (A script a termékek státuszát nem módosítja – ezt kézzel döntöd el.)")
+
     summary = (f"Párosítva SKU-val: {stats['match_sku']}, EAN-nal: {stats['match_ean']} | "
                f"Nem található: {stats['not_found']} | Azonosító nélkül: {stats['no_id']} | "
                f"Módosítva → rendelhető: {stats['to_continue']}, → nem rendelhető: {stats['to_deny']} | "
@@ -317,6 +380,13 @@ def main():
     if gh_summary:
         with open(gh_summary, 'a', encoding='utf-8') as f:
             f.write(f"## O'Neal készlet szinkron {'(DRY RUN)' if DRY_RUN else ''}\n\n")
+            f.write(f"### 💡 Javasolt LEVENNI – minden méret elfogyott ({len(suggest_off)})\n")
+            f.write("\n".join(f"- [{t}]({link}) – {info}" for t, link, info in suggest_off) or "_Nincs._")
+            f.write(f"\n\n### 💡 Kevés méret maradt (< {MIN_AVAILABLE_RATIO:.0%}) – javasolt levenni ({len(suggest_low)})\n")
+            f.write("\n".join(f"- [{t}]({link}) – {info}" for t, link, info in suggest_low) or "_Nincs._")
+            f.write(f"\n\n### 💡 Javasolt AKTIVÁLNI – draft, legalább {MIN_SIZES_TO_ACTIVATE} méret és {MIN_AVAILABLE_RATIO:.0%} elérhető ({len(suggest_on)})\n")
+            f.write("\n".join(f"- [{t}]({link}) – {info}" for t, link, info in suggest_on) or "_Nincs._")
+            f.write("\n\n_A script a termékek státuszát nem módosítja, ezek csak javaslatok._\n\n")
             f.write("| | db |\n|---|---|\n")
             for k, label in [('match_sku', 'Párosítva SKU-val'), ('match_ean', 'Párosítva EAN-nal'),
                              ('to_continue', 'Módosítva → rendelhető'), ('to_deny', 'Módosítva → nem rendelhető'),
