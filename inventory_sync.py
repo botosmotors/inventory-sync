@@ -1,460 +1,307 @@
 #!/usr/bin/env python3
 """
-O'Neal FTP Inventory to Shopify Sync V9
-AUTOMATA + TELJES ÖNELLENŐRZÉS (listázza az ÖSSZES módosítást + skipped termékeket + SKIP OKOK)
-+ DRAFT TERMÉKEK SKIP-ELÉSE
+O'Neal FTP -> Shopify készlet szinkron  V10
 
-HELYES LOGIKA:
-- Ha stock > 0  → inventory_policy = "continue" (LEHET backorder - eladható készlet nélkül)
-- Ha stock = 0  → inventory_policy = "deny"     (NE lehessen backorder - nem eladható!)
-- DRAFT termékek → NEM módosítódnak
+Mit csinál:
+- Letölti az O'Neal készletfájlt FTP-ről (item_number;stock;EAN;next_delivery;active)
+- Végigmegy a Shopify ÖSSZES aktív O'Neal termékén (lapozással, GraphQL API)
+- Változatonként párosít: először SKU alapján, ha az nem talál, akkor EAN (vonalkód) alapján
+- Beállítja az "Értékesítés készlethiány esetén" opciót:
+    O'Neal készlet > 0           -> CONTINUE (rendelhető)
+    O'Neal készlet = 0           -> DENY     (nem rendelhető, ha nincs saját készlet)
+    nincs az O'Neal listában     -> DENY     (kifutott méret; kikapcsolható: DENY_MISSING=false)
+- CSAK akkor ír a Shopify-ba, ha az érték tényleg változik (gyors, nem fut bele a limitekbe)
+- Vázlat (draft) és archivált termékekhez nem nyúl
+- A saját raktárkészletet nem módosítja (csak az inventory policy-t)
+
+V9-hez képest javítva:
+- ">10" készletérték eddig 0-nak számított -> minden ilyen változat "nem rendelhető" lett. JAVÍTVA.
+- Eddig csak az első 250 terméket nézte (nem volt lapozás). JAVÍTVA: minden termék.
+- Eddig minden futáskor minden változatot újraírt. JAVÍTVA: csak a változást írja.
+- EAN alapú tartalék párosítás.
+- Csak O'Neal szállítójú termékeket kezel (más márka SKU-ja nem keveredhet bele).
+- REST helyett GraphQL Admin API (a REST termék API kivezetés alatt áll).
+- DRY_RUN=true módban csak kiírja, mit csinálna, nem módosít semmit.
+- Összesítő a GitHub Actions "Summary" oldalán.
 """
 
-import os
-import sys
+import csv
 import ftplib
+import io
 import logging
+import os
+import re
+import sys
+import time
 from datetime import datetime
+
 import requests
 
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log = logging.getLogger(__name__)
 
-# Config from environment (GitHub Secrets)
+# ---- Beállítások (GitHub Secrets / env) ----
 ONEAL_FTP_HOST = os.getenv('ONEAL_FTP_HOST')
 ONEAL_FTP_USER = os.getenv('ONEAL_FTP_USER')
 ONEAL_FTP_PASSWORD = os.getenv('ONEAL_FTP_PASSWORD')
-ONEAL_FTP_FILE = os.getenv('ONEAL_FTP_FILE', '/download/inventories_12019_ONeal_Europe.csv')
+ONEAL_FTP_FILE = os.getenv('ONEAL_FTP_FILE') or '/download/inventories_12019_ONeal_Europe.csv'
 
 SHOPIFY_STORE = os.getenv('SHOPIFY_STORE')
 SHOPIFY_CLIENT_ID = os.getenv('SHOPIFY_CLIENT_ID')
 SHOPIFY_CLIENT_SECRET = os.getenv('SHOPIFY_CLIENT_SECRET')
 
+API_VERSION = os.getenv('SHOPIFY_API_VERSION') or '2026-01'
+VENDOR = os.getenv('VENDOR') or 'Oneal'                    # Shopify "Szállító" mező értéke
+DRY_RUN = os.getenv('DRY_RUN', 'false').lower() == 'true'  # true = csak kiírja, nem módosít
+DENY_MISSING = os.getenv('DENY_MISSING', 'true').lower() == 'true'
 
-class ShopifyAPI:
-    """Shopify Admin API wrapper - OAuth2 Client Credentials"""
-    
-    def __init__(self, store, client_id, client_secret):
-        self.store = store
-        self.client_id = client_id
-        self.client_secret = client_secret
-        self.api_version = "2024-10"
-        self.base_url = f"https://{self.store}/admin/api/{self.api_version}"
-        self.access_token = None
-        self.products = []
-        self.authenticate()
-    
-    def authenticate(self):
-        """Get OAuth2 access token using client credentials"""
-        url = f"https://{self.store}/admin/oauth/access_token"
-        
-        payload = {
-            'client_id': self.client_id,
-            'client_secret': self.client_secret,
-            'grant_type': 'client_credentials'
-        }
-        
+
+# ---------------------------------------------------------------- O'Neal FTP
+def parse_stock(value):
+    """'>10' -> 11, '6' -> 6, '' / hibás -> 0"""
+    v = (value or '').strip()
+    if not v:
+        return 0
+    m = re.search(r'\d+', v)
+    if not m:
+        return 0
+    n = int(m.group())
+    return n + 1 if v.startswith('>') else n
+
+
+def download_oneal():
+    ftp = ftplib.FTP(ONEAL_FTP_HOST, timeout=60)
+    ftp.login(ONEAL_FTP_USER, ONEAL_FTP_PASSWORD)
+    buf = io.BytesIO()
+    ftp.retrbinary(f'RETR {ONEAL_FTP_FILE}', buf.write)
+    ftp.quit()
+    raw = buf.getvalue()
+    for enc in ('utf-8-sig', 'cp1252', 'latin-1'):
         try:
-            response = requests.post(url, data=payload)
-            response.raise_for_status()
-            data = response.json()
-            self.access_token = data.get('access_token')
-            
-            if self.access_token:
-                logger.info("✅ Shopify OAuth2 authentication successful")
-                return True
-            else:
-                logger.error(f"❌ No access token in response: {data}")
-                return False
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Shopify authentication failed: {e}")
-            return False
-    
-    def get_auth_header(self):
-        """Get Authorization header"""
-        if not self.access_token:
-            return None
-        
-        return {
-            'X-Shopify-Access-Token': self.access_token,
-            'Content-Type': 'application/json'
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    log.info(f"✅ O'Neal fájl letöltve ({len(raw)//1024} KB)")
+    return text
+
+
+def parse_oneal(text):
+    """Visszaad: by_sku {sku: {...}}, by_ean {ean: {...}}"""
+    lines = text.splitlines()
+    start = next((i for i, l in enumerate(lines) if 'item_number' in l.lower()), None)
+    if start is None:
+        raise RuntimeError("Nem található 'item_number' fejléc az O'Neal fájlban")
+    reader = csv.DictReader(lines[start:], delimiter=';')
+    reader.fieldnames = [f.strip().lower() for f in reader.fieldnames]
+    by_sku, by_ean = {}, {}
+    for row in reader:
+        sku = (row.get('item_number') or '').strip()
+        if not sku:
+            continue
+        rec = {
+            'sku': sku,
+            'stock': parse_stock(row.get('stock')),
+            'raw_stock': (row.get('stock') or '').strip(),
+            'ean': (row.get('ean') or '').strip(),
+            'next_delivery': (row.get('next_delivery') or '').strip(),
         }
-    
-    def get_products(self):
-        """Get all products from Shopify (max 250) - filter by O'Neal CSV"""
-        if not self.access_token:
-            logger.error("❌ No access token available")
-            return False
-        
-        headers = self.get_auth_header()
-        
-        try:
-            # Hozz be max 250 terméket
-            url = f"{self.base_url}/products.json?limit=250"
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            
-            self.products = response.json().get('products', [])
-            logger.info(f"✅ Fetched {len(self.products)} products from Shopify")
-            return True
-            
-        except requests.exceptions.RequestException as e:
-            logger.error(f"❌ Failed to fetch products: {e}")
-            return False
-    
-    def update_inventory_policy(self, product_id, variant_id, policy):
-        """
-        Update inventory policy
-        policy = "deny"     (NE lehessen backorder - nem eladható)
-        policy = "continue" (LEHET backorder - eladható készlet nélkül)
-        """
-        if not self.access_token:
-            return False
-        
-        url = f"{self.base_url}/products/{product_id}/variants/{variant_id}.json"
-        headers = self.get_auth_header()
-        
-        payload = {
-            'variant': {
-                'inventory_policy': policy
+        by_sku[sku] = rec
+        if rec['ean']:
+            by_ean[rec['ean']] = rec
+    log.info(f"✅ O'Neal tételek: {len(by_sku)} (EAN-nal: {len(by_ean)})")
+    return by_sku, by_ean
+
+
+# ---------------------------------------------------------------- Shopify
+class Shopify:
+    def __init__(self):
+        self.url = f"https://{SHOPIFY_STORE}/admin/api/{API_VERSION}/graphql.json"
+        r = requests.post(f"https://{SHOPIFY_STORE}/admin/oauth/access_token", data={
+            'client_id': SHOPIFY_CLIENT_ID,
+            'client_secret': SHOPIFY_CLIENT_SECRET,
+            'grant_type': 'client_credentials',
+        }, timeout=30)
+        r.raise_for_status()
+        self.token = r.json()['access_token']
+        log.info("✅ Shopify bejelentkezés rendben")
+
+    def gql(self, query, variables=None, retries=6):
+        for attempt in range(retries):
+            r = requests.post(self.url, json={'query': query, 'variables': variables or {}},
+                              headers={'X-Shopify-Access-Token': self.token,
+                                       'Content-Type': 'application/json'}, timeout=60)
+            if r.status_code in (429, 502, 503):
+                time.sleep(2 ** attempt)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            errs = data.get('errors')
+            if errs and any(e.get('extensions', {}).get('code') == 'THROTTLED' for e in errs):
+                time.sleep(2 ** attempt)
+                continue
+            if errs:
+                raise RuntimeError(f"GraphQL hiba: {errs}")
+            # kíméljük a limitet
+            cost = data.get('extensions', {}).get('cost', {}).get('throttleStatus', {})
+            if cost and cost.get('currentlyAvailable', 1000) < 200:
+                time.sleep(2)
+            return data['data']
+        raise RuntimeError("Shopify API: túl sok újrapróbálkozás")
+
+    def oneal_products(self):
+        q = """
+        query($cursor: String, $q: String!) {
+          products(first: 50, after: $cursor, query: $q) {
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id title status vendor
+              variants(first: 100) {
+                nodes { id title sku barcode inventoryPolicy }
+              }
             }
-        }
-        
-        try:
-            response = requests.put(url, headers=headers, json=payload)
-            response.raise_for_status()
-            return True
-        except requests.exceptions.RequestException as e:
-            logger.debug(f"Failed to update variant {variant_id}: {e}")
-            return False
+          }
+        }"""
+        cursor, out = None, []
+        while True:
+            d = self.gql(q, {'cursor': cursor, 'q': f"vendor:'{VENDOR}' status:active"})
+            page = d['products']
+            out.extend(p for p in page['nodes'] if p['vendor'] == VENDOR and p['status'] == 'ACTIVE')
+            if not page['pageInfo']['hasNextPage']:
+                break
+            cursor = page['pageInfo']['endCursor']
+        log.info(f"✅ Aktív {VENDOR} termékek a Shopify-ban: {len(out)}")
+        return out
+
+    def set_policies(self, product_id, changes):
+        m = """
+        mutation($pid: ID!, $v: [ProductVariantsBulkInput!]!) {
+          productVariantsBulkUpdate(productId: $pid, variants: $v) {
+            userErrors { field message }
+          }
+        }"""
+        d = self.gql(m, {'pid': product_id,
+                         'v': [{'id': vid, 'inventoryPolicy': pol} for vid, pol in changes]})
+        errs = d['productVariantsBulkUpdate']['userErrors']
+        if errs:
+            raise RuntimeError(str(errs))
 
 
-class ONealFTPSync:
-    """O'Neal FTP inventory synchronizer"""
-    
-    def __init__(self, host, user, password, filename):
-        self.host = host
-        self.user = user
-        self.password = password
-        self.filename = filename
-        self.inventory_data = {}
-    
-    def download_inventory(self):
-        """Download inventory CSV from FTP - BINARY MODE"""
-        try:
-            ftp = ftplib.FTP(self.host)
-            ftp.login(self.user, self.password)
-            logger.info(f"✅ Connected to FTP: {self.host}")
-            
-            # BINÁRIS mód - teljes fájl letöltés egyszerre
-            import io
-            data_buffer = io.BytesIO()
-            ftp.retrbinary(f'RETR {self.filename}', data_buffer.write)
-            ftp.quit()
-            
-            # UTF-8 dekódolás
-            csv_content = data_buffer.getvalue().decode('utf-8')
-            logger.info(f"✅ Downloaded inventory file: {self.filename}")
-            return csv_content
-        
-        except ftplib.all_errors as e:
-            logger.error(f"❌ FTP error: {e}")
-            return None
-    
-    def parse_inventory(self, csv_content):
-        """Parse CSV and extract stock data - robust parsing"""
-        try:
-            lines = csv_content.split('\n')
-            
-            if not lines:
-                logger.error("❌ CSV is empty")
-                return False
-            
-            # Find header line (contains 'item_number')
-            header_line = None
-            header_idx = -1
-            
-            for i, line in enumerate(lines):
-                if 'item_number' in line.lower():
-                    header_line = line
-                    header_idx = i
-                    break
-            
-            if header_idx == -1:
-                logger.error("❌ Could not find header with 'item_number'")
-                return False
-            
-            logger.info(f"✅ Found header at line {header_idx}")
-            
-            # Parse data lines
-            row_count = 0
-            
-            for i in range(header_idx + 1, len(lines)):
-                line = lines[i].strip()
-                
-                if not line:
-                    continue
-                
-                # Simple split by semicolon
-                parts = line.split(';')
-                
-                if len(parts) >= 2:
-                    item_number = parts[0].strip()
-                    stock_str = parts[1].strip()
-                    
-                    if item_number:
-                        try:
-                            stock = int(stock_str)
-                        except ValueError:
-                            stock = 0
-                        
-                        self.inventory_data[item_number] = {
-                            'stock': stock,
-                            'has_stock': stock > 0
-                        }
-                        row_count += 1
-            
-            logger.info(f"✅ Parsed {row_count} items from inventory")
-            
-            # EXPORT az parsed inventory-t CSV-be debugginghoz
-            try:
-                import csv
-                with open('/tmp/parsed_inventory.csv', 'w', newline='', encoding='utf-8') as f:
-                    writer = csv.writer(f, delimiter=';')
-                    writer.writerow(['item_number', 'stock', 'has_stock'])
-                    for sku, data in sorted(self.inventory_data.items()):
-                        writer.writerow([sku, data['stock'], data['has_stock']])
-                logger.info(f"✅ Exported parsed inventory to: /tmp/parsed_inventory.csv")
-            except Exception as e:
-                logger.warning(f"⚠️ Could not export inventory CSV: {e}")
-            
-            # DEBUG: Kiírja az első 20 parsolt SKU-t
-            logger.info(f"🔍 DEBUG - Első 20 parsolt SKU:")
-            for i, (sku, data) in enumerate(list(self.inventory_data.items())[:20]):
-                logger.info(f"   {i+1}. {sku} → stock={data.get('stock')}")
-            
-            # DEBUG: Keresés az 0625-516-ra
-            if '0625-516' in self.inventory_data:
-                logger.info(f"✅ 0625-516 MEGTALÁLVA: {self.inventory_data['0625-516']}")
-            else:
-                logger.warning(f"❌ 0625-516 NINCS az inventory_data-ban!")
-                # Próbáljunk whitespace-el keresni
-                for sku in list(self.inventory_data.keys()):
-                    if '0625' in sku and '516' in sku:
-                        logger.info(f"   💡 De MEGTALÁLTAM: '{sku}' → {self.inventory_data[sku]}")
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"❌ Failed to parse CSV: {e}")
-            return False
-    
-    def get_stock_status(self, sku):
-        """Get stock status for SKU"""
-        return self.inventory_data.get(sku, {}).get('has_stock', False)
-
-
+# ---------------------------------------------------------------- main
 def main():
-    """Main sync function"""
-    logger.info("=" * 60)
-    logger.info("🚀 O'Neal FTP to Shopify Inventory Sync V9 Started")
-    logger.info(f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    logger.info("=" * 60)
-    
-    # Validate config
-    if not all([ONEAL_FTP_HOST, ONEAL_FTP_USER, ONEAL_FTP_PASSWORD, SHOPIFY_STORE, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET]):
-        logger.error("❌ Missing required environment variables")
+    log.info("=" * 60)
+    log.info(f"🚀 O'Neal készlet szinkron V10  {datetime.now():%Y-%m-%d %H:%M}"
+             f"{'   [DRY RUN – nem módosít]' if DRY_RUN else ''}")
+    log.info("=" * 60)
+
+    missing = [k for k, v in {
+        'ONEAL_FTP_HOST': ONEAL_FTP_HOST, 'ONEAL_FTP_USER': ONEAL_FTP_USER,
+        'ONEAL_FTP_PASSWORD': ONEAL_FTP_PASSWORD, 'SHOPIFY_STORE': SHOPIFY_STORE,
+        'SHOPIFY_CLIENT_ID': SHOPIFY_CLIENT_ID, 'SHOPIFY_CLIENT_SECRET': SHOPIFY_CLIENT_SECRET}.items() if not v]
+    if missing:
+        log.error(f"❌ Hiányzó beállítás: {', '.join(missing)}")
         return False
-    
-    # Initialize
-    oneal = ONealFTPSync(ONEAL_FTP_HOST, ONEAL_FTP_USER, ONEAL_FTP_PASSWORD, ONEAL_FTP_FILE)
-    shopify = ShopifyAPI(SHOPIFY_STORE, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET)
-    
-    # Check authentication
-    if not shopify.access_token:
-        logger.error("❌ Failed to authenticate with Shopify")
+
+    by_sku, by_ean = parse_oneal(download_oneal())
+    if len(by_sku) < 500:
+        # biztonsági fék: hibás/üres fájl esetén ne állítson át mindent "nem rendelhető"-re
+        log.error(f"❌ Gyanúsan kevés O'Neal tétel ({len(by_sku)}), a szinkron leáll.")
         return False
-    
-    # Download O'Neal inventory
-    csv_content = oneal.download_inventory()
-    if not csv_content:
-        logger.error("❌ Failed to download O'Neal inventory")
-        return False
-    
-    # Parse inventory
-    if not oneal.parse_inventory(csv_content):
-        logger.error("❌ Failed to parse inventory CSV")
-        return False
-    
-    # Get Shopify products
-    if not shopify.get_products():
-        logger.error("❌ Failed to fetch Shopify products")
-        return False
-    
-    # Sync inventory
-    updated_count = 0
-    skipped_count = 0
-    failed_count = 0
-    
-    # Listázáshoz
-    available_skus = []      # stock > 0 → continue (eladható készlet nélkül)
-    unavailable_skus = []    # stock = 0 → deny (nem eladható)
-    skipped_items = []       # SKU nélküli variánsok + oka
-    draft_items = []         # DRAFT termékek
-    
-    for product in shopify.products:
-        product_title = product.get('title', 'Unknown')
-        product_status = product.get('status', 'unknown')
-        
-        # SKIP OK: DRAFT TERMÉK
-        if product_status == 'draft':
-            for variant in product.get('variants', []):
-                variant_title = variant.get('title', 'Unknown')
-                draft_items.append({
-                    'product': product_title,
-                    'variant': variant_title,
-                    'status': product_status
-                })
-                skipped_count += 1
-            continue  # Skip az egész terméket
-        
-        # ACTIVE termékek feldolgozása
-        for variant in product.get('variants', []):
-            sku = variant.get('sku')
-            variant_title = variant.get('title', 'Unknown')
-            
-            # SKIP OK: Nincs SKU
-            if not sku or (isinstance(sku, str) and not sku.strip()):
-                skipped_count += 1
-                skip_reason = "Nincs SKU feltöltve a Shopify-ban"
-                skipped_items.append({
-                    'product': product_title,
-                    'variant': variant_title,
-                    'reason': skip_reason,
-                    'variant_id': variant.get('id')
-                })
-                continue
-            
-            sku = str(sku).strip()
-            
-            if not sku:
-                skipped_count += 1
-                skip_reason = "SKU üres vagy nem olvasható"
-                skipped_items.append({
-                    'product': product_title,
-                    'variant': variant_title,
-                    'reason': skip_reason,
-                    'variant_id': variant.get('id')
-                })
-                continue
-            
-            # Check O'Neal stock
-            # ⚠️ FONTOS: Csak az O'Neal-ben megtalálható SKU-kat módosítunk!
-            if sku not in oneal.inventory_data:
-                skipped_count += 1
-                skip_reason = f"SKU nincs az O'Neal készletben: {sku}"
-                skipped_items.append({
-                    'product': product_title,
-                    'variant': variant_title,
-                    'reason': skip_reason,
-                    'variant_id': variant.get('id')
-                })
-                continue
-            
-            has_stock = oneal.get_stock_status(sku)
-            actual_stock = oneal.inventory_data[sku]['stock']
-            
-            # DEBUG: Ha 0625-516, kiírja a detailokat
-            if '0625-516' in sku:
-                logger.info(f"🔍 DEBUG {sku}: actual_stock={actual_stock}, has_stock={has_stock}")
-            
-            # HELYES LOGIKA:
-            # stock > 0 → "continue" (LEHET backorder - eladható készlet nélkül)
-            # stock = 0 → "deny"     (NE lehessen backorder - nem eladható)
-            policy = "continue" if has_stock else "deny"
-            
-            # DEBUG: Ha 0625-516, kiírja a policy-t
-            if '0625-516' in sku:
-                logger.info(f"🔍 DEBUG {sku}: policy={policy}")
-            
-            # Update Shopify
-            if shopify.update_inventory_policy(product['id'], variant['id'], policy):
-                updated_count += 1
-                if has_stock:
-                    available_skus.append(sku)
-                    logger.info(f"  ✅ {sku}: Eladható készlet nélkül (continue)")
-                else:
-                    unavailable_skus.append(sku)
-                    logger.info(f"  ❌ {sku}: NEM eladható (deny)")
+
+    shop = Shopify()
+    products = shop.oneal_products()
+
+    stats = {'match_sku': 0, 'match_ean': 0, 'not_found': 0, 'no_id': 0,
+             'to_continue': 0, 'to_deny': 0, 'unchanged': 0, 'failed': 0}
+    changed_log, not_found_log, no_id_log = [], [], []
+
+    for p in products:
+        changes = []
+        for v in p['variants']['nodes']:
+            sku = (v['sku'] or '').strip()
+            bars = [b.strip() for b in re.split(r'[;,\s]+', v['barcode'] or '') if b.strip()]
+            rec = by_sku.get(sku) if sku else None
+            if rec:
+                stats['match_sku'] += 1
             else:
-                failed_count += 1
-    
-    # ========== TELJES ÖNELLENŐRZÉS ==========
-    logger.info("=" * 60)
-    logger.info("📋 TELJES ÖNELLENŐRZÉS - MÓDOSÍTOTT + SKIPPED:")
-    logger.info("=" * 60)
-    
-    if available_skus:
-        logger.info(f"\n✅ RENDELHETŐ - Készlet van ({len(available_skus)} db):")
-        for sku in sorted(available_skus)[:50]:
-            logger.info(f"   - {sku}")
-        if len(available_skus) > 50:
-            logger.info(f"   ... és további {len(available_skus) - 50} termék")
-    
-    if unavailable_skus:
-        logger.info(f"\n❌ NEM RENDELHETŐ - Nincs készlet ({len(unavailable_skus)} db):")
-        for sku in sorted(unavailable_skus)[:50]:
-            logger.info(f"   - {sku}")
-        if len(unavailable_skus) > 50:
-            logger.info(f"   ... és további {len(unavailable_skus) - 50} termék")
-    
-    if draft_items:
-        logger.info(f"\n🔴 DRAFT - NEM MÓDOSÍTOTT (INAKTÍV TERMÉKEK) ({len(draft_items)} db):")
-        logger.info("   (Draft termékek kizárva az automatikus szinkronizációból)")
-        for item in draft_items[:20]:
-            product = item.get('product', 'Unknown')
-            variant = item.get('variant', 'Unknown')
-            logger.info(f"   - {product} / {variant}")
-        if len(draft_items) > 20:
-            logger.info(f"   ... és további {len(draft_items) - 20} termék")
-    
-    if skipped_items:
-        logger.info(f"\n⚠️  SKIPPED - MIÉRT NEM MÓDOSÍTOTT ({len(skipped_items)} db):")
-        logger.info("   " + "=" * 55)
-        
-        # Csoportosítás oka szerint
-        reasons_dict = {}
-        for item in skipped_items:
-            reason = item.get('reason', 'Ismeretlen ok')
-            if reason not in reasons_dict:
-                reasons_dict[reason] = []
-            reasons_dict[reason].append(item)
-        
-        for reason, items in reasons_dict.items():
-            logger.info(f"\n   ⚠️  OK: {reason}")
-            logger.info(f"      Érintett termékek ({len(items)} db):")
-            for item in items[:15]:
-                product = item.get('product', 'Unknown')
-                variant = item.get('variant', 'Unknown')
-                logger.info(f"      - {product} / {variant}")
-            if len(items) > 15:
-                logger.info(f"      ... és további {len(items) - 15} termék")
-    
-    logger.info("\n" + "=" * 60)
-    logger.info(f"✅ Sync complete!")
-    logger.info(f"   Updated: {updated_count} variants (ACTIVE)")
-    logger.info(f"   Failed: {failed_count} variants")
-    logger.info(f"   Skipped (no SKU): {len(skipped_items)} variants")
-    logger.info(f"   Draft (inaktív): {len(draft_items)} variants")
-    logger.info("=" * 60)
-    
-    return True
+                rec = next((by_ean[b] for b in bars if b in by_ean), None)
+                if rec:
+                    stats['match_ean'] += 1
+            name = f"{p['title']} / {v['title']}"
+
+            if not rec:
+                if not sku and not bars:
+                    stats['no_id'] += 1
+                    no_id_log.append(name)
+                    continue
+                stats['not_found'] += 1
+                not_found_log.append(f"{name} ({sku or bars[0]})")
+                if not DENY_MISSING:
+                    continue
+                target = 'DENY'
+            else:
+                target = 'CONTINUE' if rec['stock'] > 0 else 'DENY'
+
+            if v['inventoryPolicy'] == target:
+                stats['unchanged'] += 1
+                continue
+            changes.append((v['id'], target))
+            stats['to_continue' if target == 'CONTINUE' else 'to_deny'] += 1
+            extra = f" (O'Neal: {rec['raw_stock']}, érkezik: {rec['next_delivery']})" if rec else " (nincs az O'Neal listában)"
+            changed_log.append(f"{'✅ rendelhető' if target == 'CONTINUE' else '⛔ nem rendelhető'}: {name}{extra}")
+
+        if changes and not DRY_RUN:
+            try:
+                shop.set_policies(p['id'], changes)
+            except Exception as e:
+                stats['failed'] += len(changes)
+                log.error(f"❌ Nem sikerült: {p['title']}: {e}")
+
+    # ---- Riport ----
+    log.info("=" * 60)
+    log.info("📋 VÁLTOZÁSOK:")
+    for line in changed_log:
+        log.info("  " + line)
+    if not changed_log:
+        log.info("  Nincs változás az előző futáshoz képest.")
+    if not_found_log:
+        log.info(f"\n⚠️  Nincs az O'Neal listában ({len(not_found_log)} db)"
+                 f"{' → nem rendelhetőre állítva' if DENY_MISSING else ' → kihagyva'}:")
+        for line in not_found_log[:100]:
+            log.info("  - " + line)
+    if no_id_log:
+        log.info(f"\n⚠️  Nincs SKU és vonalkód sem ({len(no_id_log)} db) → kihagyva:")
+        for line in no_id_log[:100]:
+            log.info("  - " + line)
+
+    summary = (f"Párosítva SKU-val: {stats['match_sku']}, EAN-nal: {stats['match_ean']} | "
+               f"Nem található: {stats['not_found']} | Azonosító nélkül: {stats['no_id']} | "
+               f"Módosítva → rendelhető: {stats['to_continue']}, → nem rendelhető: {stats['to_deny']} | "
+               f"Változatlan: {stats['unchanged']} | Hiba: {stats['failed']}")
+    log.info("\n" + "=" * 60)
+    log.info(("[DRY RUN] " if DRY_RUN else "✅ ") + summary)
+    log.info("=" * 60)
+
+    gh_summary = os.getenv('GITHUB_STEP_SUMMARY')
+    if gh_summary:
+        with open(gh_summary, 'a', encoding='utf-8') as f:
+            f.write(f"## O'Neal készlet szinkron {'(DRY RUN)' if DRY_RUN else ''}\n\n")
+            f.write("| | db |\n|---|---|\n")
+            for k, label in [('match_sku', 'Párosítva SKU-val'), ('match_ean', 'Párosítva EAN-nal'),
+                             ('to_continue', 'Módosítva → rendelhető'), ('to_deny', 'Módosítva → nem rendelhető'),
+                             ('unchanged', 'Változatlan'), ('not_found', "Nincs az O'Neal listában"),
+                             ('no_id', 'Nincs SKU és vonalkód'), ('failed', 'Hiba')]:
+                f.write(f"| {label} | {stats[k]} |\n")
+            if changed_log:
+                f.write("\n### Változások\n" + "\n".join(f"- {l}" for l in changed_log[:300]) + "\n")
+
+    return stats['failed'] == 0
 
 
 if __name__ == '__main__':
-    success = main()
-    sys.exit(0 if success else 1)
+    try:
+        ok = main()
+    except Exception as e:
+        log.exception(f"❌ Váratlan hiba: {e}")
+        ok = False
+    sys.exit(0 if ok else 1)
